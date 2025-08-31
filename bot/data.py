@@ -56,6 +56,7 @@ def save_raw_data(df, symbol, timeframe):
     df.to_csv(path, index=False)
 
 # Example usage:
-df = get_ohlcv("BTC/USDT", "15m", "2023-01-01T00:00:00Z", "2023-01-02T00:00:00Z")
+df = get_ohlcv("BTC/USDT", "15m", "2025-01-01T00:00:00Z", "2025-01-04T00:00:00Z")
 save_raw_data(df, "BTCUSDT", "15m")
+
 
