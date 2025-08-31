@@ -1,0 +1,2 @@
+ts_decision_utc,symbol,timeframe,bar_ts,signal,prob_up,entry_rule,price_ref,position_before,order_side,order_qty,order_type,order_id,order_status,fill_price,fees,position_after,sl,tp,reason,features_snapshot,model_version,pnl_realized,pnl_unrealized
+2025-08-31T15:27:41.629009,test,test,test,test,test,test,test,test,test,test,test,test,test,test,test,test,test,test,test,test,test,test,test
