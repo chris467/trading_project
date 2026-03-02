@@ -1232,3 +1232,306 @@ The Output
 What you end up with is a customer_summary table with four new columns:
 peer_group_final — the actual peer group ID used for scoring. peer_group_level — which fallback level was used (1 = ideal, 5 = population). volume_band — which turnover band the customer falls in. sic_1digit — the section-level SIC for fallback grouping.
 This joins to your main feature panel on customer_id and gives every feature standardisation step the peer group context it needs. The level column is a feature in its own right — customers at level 3, 4, or 5 are in sparse categories, which is itself potentially informative and should be surfaced in the dashboard alongside their anomaly score
+
+
+Good instinct and with hundreds of thousands of customers your thresholds are actually very achievable. Let me work through this properly.
+Is This the Best Approach?
+The 400/50 threshold logic is sound and pragmatic. But let me refine the concept slightly before you build it.
+Your current logic is:
+If 5-digit SIC count ≥ 400 → use 5-digit
+Otherwise → use 2-digit
+Then split by turnover bands with minimum 50
+The issue is that this creates a two-step process where the second step (turnover banding) can still produce groups below 50 even when the SIC group is large. You need the two decisions to be made jointly, not sequentially. A 5-digit SIC with 420 customers sounds fine until you split it across 5 turnover bands and get groups of 200, 150, 40, 20, 10.
+The better framing is:
+The peer group is the most granular combination of SIC and turnover band that still produces at least 50 members.
+This means the algorithm works from granular to broad, testing viability at each level, rather than deciding SIC granularity first and then discovering turnover banding breaks the size requirement.
+What to Do With Groups Under 50
+You have four options. Here's the honest assessment of each.
+Option 1 — Merge into the parent SIC group, drop the turnover band
+The sparse turnover band gets merged with the rest of its SIC group regardless of volume. A 5-digit SIC group with 420 customers that produces a turnover band of 30 customers gets that band merged back into the 5-digit group without volume segmentation.
+Pro: simple, keeps SIC granularity. Con: you lose the turnover differentiation for that slice, which means a very large business is compared to a very small one in the same SIC.
+Option 2 — Merge adjacent turnover bands
+Combine the sparse band with the nearest neighbouring band until the combined group hits 50. A band with 30 customers merges with the adjacent band of 60 to produce a band of 90.
+Pro: preserves approximate size segmentation. Con: the merged band now spans a wider volume range, reducing homogeneity.
+Option 3 — Fall back to 2-digit SIC with the original turnover band
+Keep the turnover band but broaden the SIC. A sparse 5-digit SIC + turnover band combination falls back to 2-digit SIC + same turnover band.
+Pro: preserves turnover segmentation which is often more behaviourally important than SIC granularity. Con: you're now comparing businesses in potentially different industries.
+Option 4 — Fall back to 2-digit SIC with no turnover band
+The nuclear option. Use only 2-digit SIC, no volume segmentation at all.
+Pro: guarantees large groups. Con: significant loss of peer homogeneity.
+The right answer is Option 2 first, then Option 3 if still sparse, then Option 4.
+Adjacent band merging preserves the most information because you're keeping the SIC granularity and approximately preserving the size segmentation. You only broaden the SIC if the turnover approach genuinely can't get you to 50.
+The Algorithm
+import pandas as pd
+import numpy as np
+import jenkspy
+
+def build_peer_groups(
+    customer_df,
+    sic_col='sic_code',          # full 5-digit SIC
+    volume_col='log_observed_volume',
+    sic_threshold=400,            # min customers for 5-digit SIC
+    group_min_size=50,            # min customers per final peer group
+    n_volume_bands=5              # target number of volume bands
+):
+    """
+    Builds peer groups from SIC and volume bands.
+    
+    Hierarchy attempted in order:
+    1. 5-digit SIC + volume band
+    2. 5-digit SIC + merged adjacent bands
+    3. 2-digit SIC + volume band  
+    4. 2-digit SIC + merged adjacent bands
+    5. 2-digit SIC only
+    6. Full population
+    """
+    
+    df = customer_df.copy()
+    
+    # Derive SIC levels
+    df['sic_5digit'] = df[sic_col].astype(str).str.zfill(5)
+    df['sic_2digit'] = df['sic_5digit'].str[:2]
+    
+    # Decide SIC level per customer based on 5-digit group size
+    sic5_counts = df['sic_5digit'].value_counts()
+    df['sic_level'] = df['sic_5digit'].map(
+        lambda x: '5digit' if sic5_counts.get(x, 0) >= sic_threshold 
+        else '2digit'
+    )
+    df['sic_active'] = np.where(
+        df['sic_level'] == '5digit',
+        df['sic_5digit'],
+        df['sic_2digit']
+    )
+    
+    # Compute global volume bands using Jenks natural breaks
+    # on the full population
+    global_breaks = compute_jenks_breaks(
+        df[volume_col].dropna(), 
+        n_classes=n_volume_bands
+    )
+    df['volume_band'] = pd.cut(
+        df[volume_col],
+        bins=global_breaks,
+        labels=False,
+        include_lowest=True
+    ).astype('Int64')  # nullable integer handles NaN
+    
+    # Initialise output columns
+    df['peer_group_id'] = None
+    df['peer_group_level'] = None
+    
+    # Process each unique SIC group
+    for sic in df['sic_active'].unique():
+        sic_mask = df['sic_active'] == sic
+        sic_df = df[sic_mask].copy()
+        sic_2 = sic[:2]
+        
+        # Try Level 1: current SIC + individual volume bands
+        level1_result = try_volume_bands(
+            sic_df, sic, group_min_size, level=1
+        )
+        if level1_result is not None:
+            df.loc[sic_mask, 'peer_group_id'] = level1_result['peer_group_id']
+            df.loc[sic_mask, 'peer_group_level'] = level1_result['level']
+            continue
+        
+        # Try Level 2: current SIC + merged adjacent bands
+        level2_result = try_merged_bands(
+            sic_df, sic, group_min_size, level=2
+        )
+        if level2_result is not None:
+            df.loc[sic_mask, 'peer_group_id'] = level2_result['peer_group_id']
+            df.loc[sic_mask, 'peer_group_level'] = level2_result['level']
+            continue
+        
+        # If we're on 5-digit SIC, try falling back to 2-digit
+        if len(sic) == 5:
+            sic_2digit_mask = df['sic_2digit'] == sic_2
+            sic_2digit_df = df[sic_2digit_mask].copy()
+            
+            # Try Level 3: 2-digit SIC + volume bands
+            level3_result = try_volume_bands(
+                sic_2digit_df, sic_2, group_min_size, level=3
+            )
+            if level3_result is not None:
+                # Only apply to customers in this specific 5-digit group
+                df.loc[sic_mask, 'peer_group_id'] = (
+                    sic_2digit_df.loc[sic_mask, 'peer_group_id']
+                    if 'peer_group_id' in sic_2digit_df.columns
+                    else level3_result['peer_group_id']
+                )
+                df.loc[sic_mask, 'peer_group_level'] = 3
+                continue
+            
+            # Try Level 4: 2-digit SIC + merged bands
+            level4_result = try_merged_bands(
+                sic_2digit_df, sic_2, group_min_size, level=4
+            )
+            if level4_result is not None:
+                df.loc[sic_mask, 'peer_group_id'] = level4_result['peer_group_id']
+                df.loc[sic_mask, 'peer_group_level'] = 4
+                continue
+            
+            # Level 5: 2-digit SIC, no volume band
+            if len(sic_2digit_df) >= group_min_size:
+                df.loc[sic_mask, 'peer_group_id'] = f"sic2_{sic_2}_all"
+                df.loc[sic_mask, 'peer_group_level'] = 5
+                continue
+        
+        # Level 6: full population fallback
+        df.loc[sic_mask, 'peer_group_id'] = 'population_all'
+        df.loc[sic_mask, 'peer_group_level'] = 6
+    
+    return df
+
+
+def compute_jenks_breaks(series, n_classes=5):
+    """Compute Jenks natural breaks, returns bin edges."""
+    clean = series.dropna()
+    
+    # Adjust classes if not enough data
+    n_classes = min(n_classes, len(clean) // 20)
+    n_classes = max(2, n_classes)
+    
+    breaks = jenkspy.jenks_breaks(clean.tolist(), n_classes=n_classes)
+    
+    # Ensure proper edges
+    breaks[0] = -np.inf
+    breaks[-1] = np.inf
+    
+    return breaks
+
+
+def try_volume_bands(sic_df, sic_label, min_size, level):
+    """
+    Attempt to assign volume bands within a SIC group.
+    Returns assignment series if all bands meet minimum size,
+    None if any band is too sparse.
+    """
+    if 'volume_band' not in sic_df.columns:
+        return None
+    
+    band_counts = sic_df['volume_band'].value_counts()
+    
+    if (band_counts < min_size).any():
+        return None  # at least one band is too sparse
+    
+    assignments = sic_df['volume_band'].map(
+        lambda b: f"sic_{sic_label}_vol{int(b)}" 
+        if pd.notna(b) else f"sic_{sic_label}_volnull"
+    )
+    
+    return {
+        'peer_group_id': assignments,
+        'level': level
+    }
+
+
+def try_merged_bands(sic_df, sic_label, min_size, level):
+    """
+    Merge adjacent volume bands until all groups meet minimum size.
+    Uses a greedy approach: finds the smallest band and merges it 
+    with its smaller neighbour.
+    """
+    if 'volume_band' not in sic_df.columns:
+        return None
+    
+    # Start with current band assignments
+    band_map = {b: b for b in sic_df['volume_band'].dropna().unique()}
+    
+    max_iterations = 10
+    iteration = 0
+    
+    while iteration < max_iterations:
+        # Compute current group sizes
+        current_bands = sic_df['volume_band'].map(band_map)
+        band_counts = current_bands.value_counts()
+        
+        if (band_counts < min_size).sum() == 0:
+            break  # all bands meet minimum
+        
+        if len(band_counts) == 1:
+            break  # can't merge further
+        
+        # Find smallest band
+        smallest_band = band_counts.idxmin()
+        sorted_bands = sorted(band_map.values())
+        idx = sorted_bands.index(smallest_band)
+        
+        # Merge with adjacent band (prefer lower neighbour)
+        if idx > 0:
+            merge_target = sorted_bands[idx - 1]
+        else:
+            merge_target = sorted_bands[idx + 1]
+        
+        # Update map: smallest band takes merge_target's label
+        for original, current in band_map.items():
+            if current == smallest_band:
+                band_map[original] = merge_target
+        
+        iteration += 1
+    
+    # Final check: do all merged groups meet minimum?
+    final_bands = sic_df['volume_band'].map(band_map)
+    final_counts = final_bands.value_counts()
+    
+    if (final_counts < min_size).any():
+        return None  # even after merging, can't achieve minimum
+    
+    # Build final peer group IDs
+    assignments = final_bands.map(
+        lambda b: f"sic_{sic_label}_merged_vol{int(b)}"
+        if pd.notna(b) else f"sic_{sic_label}_volnull"
+    )
+    
+    return {
+        'peer_group_id': assignments,
+        'level': level
+    }
+Running It and Reviewing the Output
+# Run the peer group builder
+result = build_peer_groups(
+    customer_df=customer_summary,
+    sic_col='sic_code',
+    volume_col='log_observed_volume',
+    sic_threshold=400,
+    group_min_size=50,
+    n_volume_bands=5
+)
+
+# Review the distribution of outcomes
+level_summary = result.groupby('peer_group_level').agg(
+    n_customers=('customer_id', 'count'),
+    n_groups=('peer_group_id', 'nunique')
+).reset_index()
+
+level_labels = {
+    1: '5digit SIC + volume band',
+    2: '5digit SIC + merged bands',
+    3: '2digit SIC + volume band',
+    4: '2digit SIC + merged bands',
+    5: '2digit SIC only',
+    6: 'Full population'
+}
+level_summary['description'] = level_summary['peer_group_level'].map(level_labels)
+
+print(level_summary)
+
+# Check no group is below minimum
+group_sizes = result.groupby('peer_group_id').size()
+print(f"\nSmallest group: {group_sizes.min()}")
+print(f"Largest group: {group_sizes.max()}")
+print(f"Total groups: {len(group_sizes)}")
+assert group_sizes.min() >= 50, "Groups below minimum exist - investigate"
+With hundreds of thousands of customers you should expect the vast majority to land at Level 1 or 2. Levels 3-5 will be rare SIC codes with thin representation in your book. Level 6 should be essentially empty — if many customers fall to full population fallback, your SIC data quality needs investigation.
+The One Thing to Check Carefully
+With your scale, the Jenks computation on the full population can be slow — it's O(n²) naively. If you have 500,000+ customers, either sample 50,000 for the break computation (the breaks will be virtually identical) or use a faster alternative like quantile-based cuts as a starting point and then validate against Jenks on a sample.
+# Fast alternative for large populations
+# Compute Jenks on a sample, apply breaks to full population
+sample = customer_summary['log_observed_volume'].dropna().sample(
+    n=min(50000, len(customer_summary)),
+    random_state=42
+)
+global_breaks = compute_jenks_breaks(sample, n_classes=5)
+The peer group level column becomes a feature and a governance artefact. In your dashboard, always surface which level a customer's peer group sits at. An analyst comparing a customer to "full population" needs to know the comparison is much less meaningful than one comparing to "47 other 5-digit SIC matched, similar-volume businesses."
