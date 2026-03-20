@@ -559,5 +559,73 @@ velocity_final AS (
                                                     AS shift_velocity_1d,
 
         -- Change in 3-day velocity: recent vs baseline
-        ROUND(velocity_lag_3d_w30 - velocity_lag_3d_w360, 4)
+        ROUND(velocity_lag_3d_w30 - velocity_lag_3d_w360, 4)AS shift_velocity_3d,
+
+        -- Change in steepness: has curve shape changed
+        ROUND(steepness_w30 - steepness_w360, 4)   AS shift_steepness,
+
+        -- Change in AUC: using comparable lags only
+        ROUND(auc_w30 - auc_w360_comparable_to_w30, 4)
+                                                    AS shift_auc,
+
+        -- Intermediate window shift: is recent change sustained
+        -- Positive and large = change has been developing for 90 days
+        -- Near zero = change is very recent (last 30 days only)
+        ROUND(auc_w90 -
+            (velocity_lag_1d_w360 +
+             velocity_lag_3d_w360 +
+             velocity_lag_7d_w360) / 3.0,
+        4)                                          AS shift_auc_w90,
+
+        -- Acceleration: is the change getting faster
+        -- w30 shift bigger than w90 shift = accelerating
+        ROUND(
+            (velocity_lag_1d_w30 - velocity_lag_1d_w360) -
+            (velocity_lag_1d_w90 - velocity_lag_1d_w360),
+        4)                                          AS velocity_acceleration,
+
+        -- Context fields for dashboard
+        ROUND(total_credits_w30,  2)                AS total_credits_w30,
+        ROUND(total_credits_w360, 2)                AS total_credits_w360
+
+    FROM velocity_derived
+)
+
+-- ============================================================
+-- FINAL OUTPUT
+-- One row per customer
+-- Ready to join to your master feature table
+-- ============================================================
+
+SELECT
+    customer_id,
+
+    -- Core velocity levels
+    velocity_lag_1d_w30,
+    velocity_lag_3d_w30,
+    velocity_lag_1d_w360,
+    velocity_lag_30d_w360,
+
+    -- Steepness
+    steepness_w30,
+    steepness_w360,
+
+    -- AUC
+    auc_w30,
+    auc_w360,
+
+    -- PRIMARY MODEL FEATURES - shift signals
+    shift_velocity_1d,
+    shift_velocity_3d,
+    shift_steepness,
+    shift_auc,
+    shift_auc_w90,
+    velocity_acceleration,
+
+    -- Context
+    total_credits_w30,
+    total_credits_w360
+
+FROM velocity_final
+ORDER BY shift_steepness DESC
   
